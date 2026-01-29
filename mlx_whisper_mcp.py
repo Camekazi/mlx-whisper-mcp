@@ -5,10 +5,13 @@
 #     "mlx-whisper",
 #     "rich",
 #     "yt-dlp",
+#     "pyannote.audio",
+#     "torch",
 # ]
 # ///
 
 import base64
+import json
 import logging
 import os
 import tempfile
@@ -46,6 +49,16 @@ try:
     log.info("[green]Successfully imported yt-dlp[/green]", extra={"markup": True})
 except ImportError:
     log.warning("Error: yt-dlp not installed. Install with 'uv pip install yt-dlp'.")
+
+try:
+    from pyannote.audio import Pipeline
+    import torch
+
+    log.info("[green]Successfully imported pyannote.audio[/green]", extra={"markup": True})
+    DIARIZATION_AVAILABLE = True
+except ImportError:
+    log.warning("Warning: pyannote.audio not installed. Speaker diarization unavailable.")
+    DIARIZATION_AVAILABLE = False
 
 
 server = FastMCP(
@@ -223,6 +236,160 @@ async def transcribe_youtube(
     except Exception as e:
         log.error(f"Error transcribing YouTube video: {str(e)}")
         return f"Error transcribing YouTube video: {str(e)}"
+
+
+@server.tool()
+async def transcribe_with_metadata(
+    file_path: str | Path,
+    language: Optional[str] = "en",
+    task: Literal["transcribe", "translate"] = "transcribe",
+    word_timestamps: bool = True,
+) -> str:
+    """Transcribe an audio file and return detailed JSON metadata.
+
+    Args:
+        file_path: Path to the audio file
+        language: Optional language code to force a specific language
+        task: Task to perform (transcribe or translate)
+        word_timestamps: Include word-level timestamps (default: True)
+
+    Returns:
+        JSON string with full transcription metadata including:
+        - text: Full transcription text
+        - segments: List of segments with timestamps
+        - words: Word-level timestamps (if enabled)
+        - language: Detected/specified language
+        - duration: Audio duration
+    """
+    assert Path(file_path).exists(), f"File not found: {file_path}"
+    try:
+        log.info(f"Transcribing with metadata: {file_path}")
+
+        result = mlx_whisper.transcribe(
+            file_path,
+            path_or_hf_repo=MODEL_PATH,
+            language=language,
+            task=task,
+            word_timestamps=word_timestamps,
+        )
+
+        # Build metadata structure
+        metadata = {
+            "text": result["text"],
+            "language": result.get("language", language),
+            "segments": result.get("segments", []),
+            "file_path": str(file_path),
+        }
+
+        # Save JSON output
+        output_file = Path(DATA_DIR) / f"{Path(file_path).stem}_metadata.json"
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        log.info(f"Saved metadata to: {output_file}")
+
+        return json.dumps(metadata, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+        log.error(f"Error transcribing with metadata: {str(e)}")
+        return json.dumps({"error": str(e)})
+
+
+@server.tool()
+async def transcribe_with_diarization(
+    file_path: str | Path,
+    language: Optional[str] = "en",
+    task: Literal["transcribe", "translate"] = "transcribe",
+    hf_token: Optional[str] = None,
+) -> str:
+    """Transcribe an audio file with speaker diarization (who spoke when).
+
+    Args:
+        file_path: Path to the audio file
+        language: Optional language code to force a specific language
+        task: Task to perform (transcribe or translate)
+        hf_token: HuggingFace token for pyannote.audio models (required first time)
+
+    Returns:
+        JSON string with transcription and speaker labels for each segment
+    """
+    if not DIARIZATION_AVAILABLE:
+        return json.dumps({
+            "error": "Speaker diarization unavailable. Install with: uv pip install pyannote.audio torch"
+        })
+
+    assert Path(file_path).exists(), f"File not found: {file_path}"
+
+    try:
+        log.info(f"Transcribing with speaker diarization: {file_path}")
+
+        # Step 1: Get transcription with timestamps
+        transcription_result = mlx_whisper.transcribe(
+            file_path,
+            path_or_hf_repo=MODEL_PATH,
+            language=language,
+            task=task,
+            word_timestamps=True,
+        )
+
+        # Step 2: Perform speaker diarization
+        log.info("Performing speaker diarization...")
+
+        # Load diarization pipeline
+        if hf_token:
+            diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token
+            )
+        else:
+            # Try without token (if model already downloaded)
+            diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1"
+            )
+
+        # Run diarization
+        diarization = diarization_pipeline(file_path)
+
+        # Step 3: Map speakers to segments
+        segments_with_speakers = []
+        for segment in transcription_result.get("segments", []):
+            segment_start = segment["start"]
+            segment_end = segment["end"]
+
+            # Find which speaker(s) spoke during this segment
+            speakers = []
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                if turn.start < segment_end and turn.end > segment_start:
+                    if speaker not in speakers:
+                        speakers.append(speaker)
+
+            segments_with_speakers.append({
+                "start": segment_start,
+                "end": segment_end,
+                "text": segment["text"],
+                "speakers": speakers if speakers else ["UNKNOWN"],
+            })
+
+        # Build result
+        result = {
+            "text": transcription_result["text"],
+            "language": transcription_result.get("language", language),
+            "segments_with_speakers": segments_with_speakers,
+            "file_path": str(file_path),
+        }
+
+        # Save JSON output
+        output_file = Path(DATA_DIR) / f"{Path(file_path).stem}_diarized.json"
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+
+        log.info(f"Saved diarized transcription to: {output_file}")
+
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+        log.error(f"Error with speaker diarization: {str(e)}")
+        return json.dumps({"error": str(e)})
 
 
 if __name__ == "__main__":
